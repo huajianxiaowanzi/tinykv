@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git rm *)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "Bash(xargs wc *)",
+      "Bash(wmic logicaldisk *)",
+      "Bash(docker system *)",
+      "Bash(git reset *)"
+    ]
+  }
+}
