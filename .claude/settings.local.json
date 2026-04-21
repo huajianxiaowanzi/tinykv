@@ -11,7 +11,8 @@
       "Bash(docker system *)",
       "Bash(git reset *)",
       "Bash(git pull *)",
-      "Bash(git stash *)"
+      "Bash(git stash *)",
+      "Bash(git checkout *)"
     ]
   }
 }

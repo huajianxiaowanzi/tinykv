@@ -109,7 +109,7 @@ Peer storage is what you interact with through the `Storage` interface in part A
 
 These states are stored in two badger instances: raftdb and kvdb:
 
-- raftdb stores raft log and `RaftLocalState`
+- raftdb stores raft log and `RaftLocalState`D:\GolandProjects\tinykv\doc\project2-RaftKV.md
 - kvdb stores key-value data in different column families, `RegionLocalState` and `RaftApplyState`. You can regard kvdb as the state machine mentioned in Raft paper
 
 The format is as below and some helper functions are provided in `kv/raftstore/meta`, and set them to badger with `writebatch.SetMeta()`.

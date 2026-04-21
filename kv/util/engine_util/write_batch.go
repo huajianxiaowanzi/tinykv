@@ -26,6 +26,7 @@ func (wb *WriteBatch) Len() int {
 	return len(wb.entries)
 }
 
+// put输入到db中
 func (wb *WriteBatch) SetCF(cf string, key, val []byte) {
 	wb.entries = append(wb.entries, &badger.Entry{
 		Key:   KeyWithCF(cf, key),
@@ -41,6 +42,7 @@ func (wb *WriteBatch) DeleteMeta(key []byte) {
 	wb.size += len(key)
 }
 
+// 在db中删除数据
 func (wb *WriteBatch) DeleteCF(cf string, key []byte) {
 	wb.entries = append(wb.entries, &badger.Entry{
 		Key: KeyWithCF(cf, key),

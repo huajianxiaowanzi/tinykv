@@ -11,6 +11,8 @@ import (
 // Some helper methods can be found in sever.go in the current directory
 
 // RawGet return the corresponding Get response based on RawGetRequest's CF and Key fields
+// 1. 获取reader
+// 2. 调用reader的GetCF方法获取值
 func (server *Server) RawGet(ctx context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
 	// Your Code Here (1).
 	reader, err := server.storage.Reader(req.Context)
@@ -66,6 +68,10 @@ func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest
 }
 
 // RawScan scan the data starting from the start key up to limit. and return the corresponding result
+// 1. 获取reader
+// 2. 获取迭代器
+// 3. 从startKey开始迭代，直到limit个kv或者迭代器无效
+// 4. 将结果封装成RawScanResponse返回
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
 	// Your Code Here (1).
 	// Hint: Consider using reader.IterCF

@@ -59,6 +59,7 @@ const (
 	// 'MessageType_MsgPropose' is a local message that proposes to append data to the leader's log entries.
 	MessageType_MsgPropose MessageType = 2
 	// 'MessageType_MsgAppend' contains log entries to replicate.
+	// 用于 Leader 给其他节点同步日志条目
 	MessageType_MsgAppend MessageType = 3
 	// 'MessageType_MsgAppendResponse' is response to log replication request('MessageType_MsgAppend').
 	MessageType_MsgAppendResponse MessageType = 4
@@ -72,10 +73,10 @@ const (
 	MessageType_MsgHeartbeat MessageType = 8
 	// 'MessageType_MsgHeartbeatResponse' is a response to 'MessageType_MsgHeartbeat'.
 	MessageType_MsgHeartbeatResponse MessageType = 9
-	// 'MessageType_MsgTransferLeader' requests the leader to transfer its leadership.
+	// 'MessageType_MsgTransferLeader' requests the leader to transfer its leadership.上层请求转移 Leader
 	MessageType_MsgTransferLeader MessageType = 11
 	// 'MessageType_MsgTimeoutNow' send from the leader to the leadership transfer target, to let
-	// the transfer target timeout immediately and start a new election.
+	// the transfer target timeout immediately and start a new election.节点收到后清空 r.electionElapsed，并即刻发起选举
 	MessageType_MsgTimeoutNow MessageType = 12
 )
 
