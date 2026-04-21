@@ -9,7 +9,9 @@
       "Bash(xargs wc *)",
       "Bash(wmic logicaldisk *)",
       "Bash(docker system *)",
-      "Bash(git reset *)"
+      "Bash(git reset *)",
+      "Bash(git pull *)",
+      "Bash(git stash *)"
     ]
   }
 }
