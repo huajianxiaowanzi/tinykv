@@ -20,6 +20,28 @@ make project4b    # Test KvGet/KvPrewrite/KvCommit
 make project4c    # Test KvScan/KvCheckTxnStatus/KvBatchRollback/KvResolveLock
 ```
 
+## Future: TinyKV Operator Plan
+
+After completing core TinyKV functionality, implement a Kubernetes Operator for automated deployment and operations:
+
+### Planned CRDs
+- `TinyKVCluster` - Main cluster resource (Scheduler, Store, Region configuration)
+- `TinyKVBackup` - Scheduled backup to S3/NFS
+- `TinyKVRestore` - Restore from backup
+- `TinyKVScale` - Auto-scaling based on region count/metrics
+
+### Core Features
+- Automatic Store failover and recovery
+- Graceful scale-in with Region migration
+- TLS certificate rotation
+- PVC rebinding for rebuilt Pods
+- Integration with Scheduler API for balance operations
+
+### Tech Stack
+- Operator-SDK (Go)
+- controller-runtime
+- Helm Chart for packaging
+
 Run single test: `go test -v ./path/to/package -run TestName`
 
 ## Windows 11 Test Commands (without make)
