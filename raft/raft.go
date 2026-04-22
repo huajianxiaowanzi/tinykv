@@ -239,7 +239,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		r.msgs = append(r.msgs, appendMsg)
 		return true
 	}
-	// 有错误，说明 nextIndex 存在于快照中，此时需要发送快照给 followers
+	// 获取任期 有错误，说明 nextIndex 存在于快照中，此时需要发送快照给 followers
 	//2C
 	r.sendSnapshot(to)
 	log.Infof("[Snapshot Request]%d to %d, prevLogIndex %v, dummyIndex %v", r.id, to, prevLogIndex, r.RaftLog.dummyIndex)
@@ -260,6 +260,9 @@ func (r *Raft) sendHeartbeat(to uint64) {
 func (r *Raft) sendSnapshot(to uint64) {
 	snapshot, err := r.RaftLog.storage.Snapshot() // 从持久化存储中获取最近的快照
 	if err != nil {
+		// 生成 Snapshot 的工作是由 region worker 异步执行的，如果 Snapshot 还没有准备好
+		// 此时会返回 ErrSnapshotTemporarilyUnavailable 错误，此时 leader 应该放弃本次 Snapshot Request
+		// 等待下一次再请求 storage 获取 snapshot（通常来说会在下一次 heartbeat response 的时候发送 snapshot）
 		return
 	}
 	r.msgs = append(r.msgs, pb.Message{
@@ -406,7 +409,8 @@ func (r *Raft) flowerStep(m pb.Message) {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
-
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	}
 }
 
@@ -429,6 +433,8 @@ func (r *Raft) candidateStep(m pb.Message) {
 	case pb.MessageType_MsgHeartbeat:
 		// 接收心跳包，重置超时，称为跟随者，回发心跳包的resp
 		r.handleHeartbeat(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	}
 }
 
@@ -734,7 +740,7 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	}
 }
 
-// handleSnapshot handle Snapshot RPC request
+// handleSnapshot handle Snapshot RPC request leader和follower都要从snapshot中恢复数据
 // 从 SnapshotMetadata 中恢复 Raft 的内部状态，例如 term、commit、membership information
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
@@ -760,13 +766,13 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		r.RaftLog.committed = meta.Index
 		r.RaftLog.applied = meta.Index
 		r.RaftLog.stabled = meta.Index
-		r.RaftLog.pendingSnapshot = m.Snapshot
+		r.RaftLog.pendingSnapshot = m.Snapshot // 正在接收快照
 		r.RaftLog.entries = make([]pb.Entry, 0)
-		// 更新集群配置 TODO follower不需要更新这个吧
-		//r.Prs = make(map[uint64]*Progress)
-		//for _, id := range meta.ConfState.Nodes {
-		//	r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
-		//}
+		// 更新集群配置
+		r.Prs = make(map[uint64]*Progress)
+		for _, id := range meta.ConfState.Nodes {
+			r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
+		}
 		// 更新 response，提示 leader 更新 nextIndex
 		resp.Index = meta.Index
 	}

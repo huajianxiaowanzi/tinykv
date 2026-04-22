@@ -437,6 +437,7 @@ func (d *peerMsgHandler) handleProposal(entry *pb.Entry, resp *raft_cmdpb.RaftCm
 	}
 }
 
+// 接受msg的peer， 收到msg后进行相应的处理
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 	switch msg.Type {
 	case message.MsgTypeRaftMessage:
@@ -506,11 +507,84 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
-	if msg.Requests != nil {
-		d.proposeRequest(msg, cb)
+	if msg.AdminRequest != nil {
+		d.proposeAdminRequest(msg, cb)
 	} else {
-		//暂时不管
-		//d.proposeAdminRequest(msg, cb)
+		d.proposeRequest(msg, cb)
+	}
+}
+
+func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	switch msg.AdminRequest.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog: // 日志压缩需要提交到 raft 同步
+		data, err := msg.Marshal()
+		if err != nil {
+			log.Panic(err)
+		}
+		if err := d.RaftGroup.Propose(data); err != nil {
+			log.Panic(err)
+		}
+	case raft_cmdpb.AdminCmdType_TransferLeader:
+		// 领导权禅让直接执行，不需要提交到 raft
+		// 执行领导权禅让
+		d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
+		// 返回 response
+		adminResp := &raft_cmdpb.AdminResponse{
+			CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+			TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+		}
+		cb.Done(&raft_cmdpb.RaftCmdResponse{
+			Header:        &raft_cmdpb.RaftResponseHeader{},
+			AdminResponse: adminResp,
+		})
+	case raft_cmdpb.AdminCmdType_ChangePeer:
+		// 集群成员变更，需要提交到 raft，并处理 proposal 回调
+		// 单步成员变更：前一步成员变更被提交之后才可以执行下一步成员变更
+		if d.peerStorage.AppliedIndex() >= d.RaftGroup.Raft.PendingConfIndex {
+			// 如果 region 只有两个节点，并且需要 remove leader，则需要先完成 transferLeader
+			if len(d.Region().Peers) == 2 && msg.AdminRequest.ChangePeer.ChangeType == pb.ConfChangeType_RemoveNode && msg.AdminRequest.ChangePeer.Peer.Id == d.PeerId() {
+				for _, p := range d.Region().Peers {
+					if p.Id != d.PeerId() {
+						d.RaftGroup.TransferLeader(p.Id)
+						break
+					}
+				}
+			}
+			// 1. 创建 proposal
+			d.proposals = append(d.proposals, &proposal{
+				index: d.nextProposalIndex(),
+				term:  d.Term(),
+				cb:    cb,
+			})
+			// 2. 提交到 raft
+			context, _ := msg.Marshal()
+			d.RaftGroup.ProposeConfChange(pb.ConfChange{
+				ChangeType: msg.AdminRequest.ChangePeer.ChangeType, // 变更类型
+				NodeId:     msg.AdminRequest.ChangePeer.Peer.Id,    // 变更成员 id
+				Context:    context,                                // request data
+			})
+		}
+	case raft_cmdpb.AdminCmdType_Split:
+		// Region 分裂
+		// 如果收到的 Region Split 请求是一条过期的请求，则不应该提交到 Raft
+		if err := util.CheckRegionEpoch(msg, d.Region(), true); err != nil {
+			log.Infof("[AdminCmdType_Split] Region %v Split, a expired request", d.Region())
+			cb.Done(ErrResp(err))
+			return
+		}
+		if err := util.CheckKeyInRegion(msg.AdminRequest.Split.SplitKey, d.Region()); err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+		log.Infof("[AdminCmdType_Split Propose] Region %v Split, entryIndex %v", d.Region(), d.nextProposalIndex())
+		// 否则的话 Region 还没有开始分裂，则将请求提交到 Raft
+		d.proposals = append(d.proposals, &proposal{
+			index: d.nextProposalIndex(),
+			term:  d.Term(),
+			cb:    cb,
+		})
+		data, _ := msg.Marshal()
+		d.RaftGroup.Propose(data)
 	}
 }
 
@@ -579,6 +653,7 @@ func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
 	d.ctx.raftLogGCTaskSender <- raftLogGCTask
 }
 
+// peer收到msg后通过step 输入RawNode
 func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 	log.Debugf("%s handle raft message %s from %d to %d",
 		d.Tag, msg.GetMessage().GetMsgType(), msg.GetFromPeer().GetId(), msg.GetToPeer().GetId())
@@ -821,19 +896,22 @@ func (d *peerMsgHandler) findSiblingRegion() (result *metapb.Region) {
 	return
 }
 
+// 定时器触发，定期检查是否需要压缩日志。 压缩firstIdx到appliedIdx之间的日志
 func (d *peerMsgHandler) onRaftGCLogTick() {
 	d.ticker.schedule(PeerTickRaftLogGC)
+	// 只有 Leader 才能发起压缩
 	if !d.IsLeader() {
 		return
 	}
-
-	appliedIdx := d.peerStorage.AppliedIndex()
-	firstIdx, _ := d.peerStorage.FirstIndex()
+	//日志: [firstIdx ... ... ... appliedIdx ... ... lastIdx]
+	//	       ↑ 已压缩的边界           ↑ 已应用到状态机
+	appliedIdx := d.peerStorage.AppliedIndex() // 已应用到状态机的日志位置
+	firstIdx, _ := d.peerStorage.FirstIndex()  // 日志中最早一条的位置
 	var compactIdx uint64
 	if appliedIdx > firstIdx && appliedIdx-firstIdx >= d.ctx.cfg.RaftLogGcCountLimit {
 		compactIdx = appliedIdx
 	} else {
-		return
+		return // 日志不够多，不压缩
 	}
 
 	y.Assert(compactIdx > 0)
@@ -843,7 +921,7 @@ func (d *peerMsgHandler) onRaftGCLogTick() {
 		return
 	}
 
-	term, err := d.RaftGroup.Raft.RaftLog.Term(compactIdx)
+	term, err := d.RaftGroup.Raft.RaftLog.Term(compactIdx) // 查询 compactIdx 的任期号
 	if err != nil {
 		log.Fatalf("appliedIdx: %d, firstIdx: %d, compactIdx: %d", appliedIdx, firstIdx, compactIdx)
 		panic(err)

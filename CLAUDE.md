@@ -244,6 +244,61 @@ type proposal struct {
 - `proposals` 列表通过 `index+term` 唯一标识每个请求
 - Apply 时根据 `entry.Index` 找到对应的 `proposal` 并回调
 
+### CompactLog 日志压缩详细流程
+
+**位置**: `kv/raftstore/peer_msg_handler.go`, `kv/raftstore/runner/raftlog_gc.go`
+
+```
+┌──────────────────────────────────────────────┐
+│ ① onRaftGcLogTick() — 定时器触发             │
+│   只有 Leader 能发起                         │
+│   检查: appliedIdx - firstIdx >= 阈值         │
+│   compactIdx = appliedIdx - 1                │
+│   创建 CompactLogRequest(compactIdx, term)    │
+└──────────────────┬───────────────────────────┘
+                   │ proposeRaftCommand(request, nil)
+                   ▼
+┌──────────────────────────────────────────────┐
+│ ② Raft 共识 — 和普通写入一样走完整共识流程    │
+│   Leader 复制 → 多数确认 → Commit             │
+└──────────────────┬───────────────────────────┘
+                   │ Apply (所有节点)
+                   ▼
+┌──────────────────────────────────────────────┐
+│ ③ processAdminRequest() — Apply 时处理       │
+│   防御性检查: compactIndex > truncatedState   │
+│   更新 TruncatedState (index, term)           │
+│   调用 ScheduleCompactLog(compactIndex)       │
+└──────────────────┬───────────────────────────┘
+                   │ 发送任务到 channel
+                   ▼
+┌──────────────────────────────────────────────┐
+│ ④ ScheduleCompactLog() — 构造 GC 任务        │
+│   RaftLogGCTask {StartIdx, EndIdx}            │
+│   StartIdx = d.LastCompactedIdx               │
+│   EndIdx = truncatedIndex + 1                 │
+│   d.LastCompactedIdx = EndIdx                 │
+│   发送到 raftLogGCTaskSender channel          │
+└──────────────────┬───────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────────────┐
+│ ⑤ RaftLogGCTaskHandler.Handle() — 物理删除   │
+│   遍历 [StartIdx, EndIdx) 逐条删除 raftdb    │
+│   中的日志条目                                │
+└──────────────────────────────────────────────┘
+```
+
+**核心设计**: 两阶段分离
+- **元数据变更**（更新 TruncatedState）走 Raft 共识 → 保证所有节点一致
+- **物理删除**（从 raftdb 删除旧日志）异步执行 → 不阻塞主流程，各节点独立完成
+
+**关键点**:
+- Propose 是 Leader 独占的权力，但 Apply 是所有节点的义务（所有节点都会删自己的日志）
+- compactIdx 减 1 是因为必须保留一条已应用日志作为截断边界
+- CompactLog 走 Raft 保证了顺序性：Apply CompactLog 时，所有节点必然已 Apply 了 compactIdx 之前的全部日志，不会误删
+- 物理删除不需要共识——只要 TruncatedState 一致，各节点可以各自慢慢删，删多删少无所谓，下次 GC 会补上
+
 ### Key Design Patterns
 
 - **Column Families**: Simulated via key prefixing (`${cf}_${key}`) in Badger

@@ -237,7 +237,7 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.CommittedEntries) > 0 {
 		rn.Raft.RaftLog.applied += uint64(len(rd.CommittedEntries)) // applide 指针更新
 	}
-	rn.Raft.RaftLog.maybeCompact()        // 丢弃被压缩的暂存日志
+	rn.Raft.RaftLog.maybeCompact()        // 丢弃被压缩的暂存日志 2C
 	rn.Raft.RaftLog.pendingSnapshot = nil // 清空pendingSnapshot
 	rn.Raft.msgs = nil                    // 清空msgs
 }

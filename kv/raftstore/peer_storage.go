@@ -187,10 +187,12 @@ func (ps *PeerStorage) Snapshot() (eraftpb.Snapshot, error) {
 		Receiver:  ch,
 	}
 	// schedule snapshot generate task
+	// 给 Region Worker 发任务：请生成快照
 	ps.regionSched <- &runner.RegionTaskGen{
 		RegionId: ps.region.GetId(),
-		Notifier: ch,
+		Notifier: ch, // 通知通道，快照生成完毕后通过这里通知
 	}
+	// 立刻返回"快照还没准备好"的错误
 	return snapshot, raft.ErrSnapshotTemporarilyUnavailable
 }
 
@@ -332,6 +334,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	return nil
 }
 
+// 应用一个快照之后 RaftLog 里面只包含了快照中的日志，并且快照中的数据都是已经被应用了的
 // Apply the peer with given snapshot
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
 	log.Infof("%v begin to apply snapshot", ps.Tag)
@@ -343,8 +346,40 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
+	//提示：这里需要做的事情包括：更新对等存储状态，如raftState和applyState等，
+	//并通过ps.regionSched将RegionTaskApply任务发送给区域工作者，还请记住调用ps.clearMeta
+	//和ps.clearExtraData删除过时数据
 	// Your Code Here (2C).
-	return nil, nil
+	// 1. 删除过时数据
+	if ps.isInitialized() {
+		ps.clearMeta(kvWB, raftWB)
+		ps.clearExtraData(snapData.Region)
+	}
+	// 2. 更新 peer_storage 的内存状态，包括：
+	// (1). RaftLocalState: 已经「持久化」到DB的最后一条日志设置为快照的最后一条日志
+	// (2). RaftApplyState: 「applied」和「truncated」日志设置为快照的最后一条日志
+	// (3). snapState: SnapState_Applying
+	ps.raftState.LastIndex, ps.raftState.LastTerm = snapshot.Metadata.Index, snapshot.Metadata.Term
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Index, ps.applyState.TruncatedState.Term = snapshot.Metadata.Index, snapshot.Metadata.Term
+	ps.snapState.StateType = snap.SnapState_Applying
+	if err := kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState); err != nil {
+		log.Panic(err)
+	}
+	// 3. 发送 runner.RegionTaskApply 任务给 region worker，并等待处理完毕
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: ps.region.Id,
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+	<-ch
+	log.Infof("%v end to apply snapshot, metaDataIndex %v, truncatedStateIndex %v", ps.Tag, snapshot.Metadata.Index, ps.applyState.TruncatedState.Index)
+	result := &ApplySnapResult{PrevRegion: ps.region, Region: snapData.Region}
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+	return result, nil
 }
 
 // raftDB 存储：
