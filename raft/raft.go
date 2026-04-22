@@ -411,7 +411,18 @@ func (r *Raft) flowerStep(m pb.Message) {
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTransferLeader:
+		// follower 收到发来的禅让消息，转发给leader
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
+
+	case pb.MessageType_MsgTimeoutNow:
+		// 收到Leader发来的要求立马开始选举的消息
+		r.handleTimeoutNowRequest(m) // MessageType_MsgHup
 	}
+
 }
 
 func (r *Raft) candidateStep(m pb.Message) {
@@ -435,6 +446,14 @@ func (r *Raft) candidateStep(m pb.Message) {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTransferLeader:
+		//Local Msg，用于上层请求转移 Leader
+		//要求领导转移其领导权
+		// 非 leader 收到领导权禅让消息，需要转发给 leader
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
 	}
 }
 
@@ -470,24 +489,63 @@ func (r *Raft) leaderStep(m pb.Message) {
 		//Common Msg，即节点对心跳的回应
 		r.handleHeartbeatResponse(m)
 	case pb.MessageType_MsgTransferLeader:
+		// 3A
 		//Local Msg，用于上层请求转移 Leader
-		//要求领导转移其领导权
-		//TODO project3
-	case pb.MessageType_MsgTimeoutNow:
-		//Local Msg，节点收到后清空 r.electionElapsed，并即刻发起选举
-		//从领导发送到领导转移目标，以让传输目标立即超时并开始新的选择。
-		//TODO project3
+		// leader 收到下台指令，进行处理
+		r.handleTransferLeader(m)
+	}
+}
+
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	// 判断消息发送者是否在集群中
+	if _, ok := r.Prs[m.From]; !ok {
+		return
+	}
+	// 如果消息发送者就是leader本身，则无事发生
+	if m.From == r.id {
+		return
+	}
+	// 判断是否有转让流程正在进行，如果是相同节点的转让流程就返回，否则的话终止上一个转让流程
+	if r.leadTransferee != None {
+		if r.leadTransferee == m.From { // 此前就有 这个禅让请求，所有停止第二个禅让。
+			return
+		}
+		r.leadTransferee = None // 丢弃之前的 禅让请求
+	}
+	r.leadTransferee = m.From
+	r.transferElapsed = 0
+	if r.Prs[m.From].Match == r.RaftLog.LastIndex() { // 发送者的日志和leader相同， 直接禅让
+		r.sendTimeoutNow(m.From)
+	} else {
+		r.sendAppend(m.From) // 同步新日志，Leader在接收到日志复制的response的时候继续禅让
 	}
 }
 
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; !ok {
+		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
+		r.PendingConfIndex = None // 清除 PendingConfIndex 表示当前没有未完成的配置更新
+	}
 }
 
 // removeNode remove a node from raft group
+// 1.从集群中踢掉节点
+// 2.检查降低的多数派门槛是否推进了
+// 3.commit、标记配置变更完成。
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; ok {
+		// 从 Prs 删除节点 → 集群成员减少
+		delete(r.Prs, id)
+		// 移除节点会降低多数派门槛，可能导致之前无法提交的日志现在可以提交了
+		if r.State == StateLeader && r.maybeCommit() {
+			log.Infof("[removeNode commit] %v leader commit new entry, commitIndex %v", r.id, r.RaftLog.committed)
+			r.broadcastAppendEntry() // 广播更新所有 follower 的 commitIndex
+		}
+	}
+	r.PendingConfIndex = None // 清除 PendingConfIndex 表示当前没有未完成的配置更新
 }
 
 /* ******************************** Msg Handle ******************************** */
@@ -638,6 +696,8 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 			r.broadcastAppendEntry()
 		}
 	}
+	// 3A
+	// 由于follower 的日志不是最新的，所以leader没法禅让，leader给follower append日志，当leader收到 append的响应时， 继续禅让
 	if r.leadTransferee == m.From && r.Prs[m.From].Match == r.RaftLog.LastIndex() {
 		// AppendEntryResponse 回复来自 leadTransferee，检查日志是否是最新的
 		// 如果 leadTransferee 达到了最新的日志则立即发起领导权禅让
@@ -692,8 +752,21 @@ func (r *Raft) broadcastAppendEntry() {
 	}
 }
 
+// 3A
 func (r *Raft) sendTimeoutNow(to uint64) {
+	// 发送任期超时消息， follower收到这个消息，立马开始选举
 	r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgTimeoutNow, From: r.id, To: to})
+}
+
+// 3A
+func (r *Raft) handleTimeoutNowRequest(m pb.Message) {
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
+	// 直接发起选举
+	if err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup}); err != nil {
+		log.Panic(err)
+	}
 }
 
 // broadcastHeartBeat 广播心跳消息
