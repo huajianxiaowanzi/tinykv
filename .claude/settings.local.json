@@ -14,7 +14,9 @@
       "Bash(git stash *)",
       "Bash(git checkout *)",
       "Bash(go test *)",
-      "Bash(xargs grep *)"
+      "Bash(xargs grep *)",
+      "Bash(LOG_LEVEL=debug go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run \"TestBasicConfChange3B\" -timeout=30s)",
+      "Bash(LOG_LEVEL=info go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run \"TestBasicConfChange3B\" -timeout=30s)"
     ]
   }
 }

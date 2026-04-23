@@ -279,7 +279,33 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
+	epoch := region.GetRegionEpoch()
+	if epoch == nil {
+		return errors.Errorf("region has no epoch")
 
+	}
+	// 找同 ID 的旧 Region。Scheduler 维护了一张表，记录所有 Region 的信息。用 region.GetID() 查找是否已经记录过这个 Region
+	oldRegion := c.GetRegion(region.GetID())
+	if oldRegion != nil {
+		oldEpoch := oldRegion.GetRegionEpoch()
+		if epoch.ConfVer < oldEpoch.ConfVer || epoch.Version < oldEpoch.Version { // 新心跳的任一版本号小于已有的，说明是过时心跳，拒绝。
+			return errors.Errorf("region is stale")
+		}
+	} else { // 同 ID 不存在，这是"新"Region。但这不一定是真的新——可能是 Split 产生的新 Region。
+		// 2. 扫描所有重叠的 region
+		regions := c.ScanRegions(region.GetStartKey(), region.GetEndKey(), -1)
+		for _, r := range regions {
+			rEpoch := r.GetRegionEpoch()
+			if epoch.ConfVer < rEpoch.ConfVer || epoch.Version < rEpoch.Version { // 如果新region 小于 重叠的region，拒绝
+				return errors.Errorf("region is stale")
+			}
+		}
+	}
+	// region 是最新的，更新 region tree 和 store status
+	c.putRegion(region)
+	for i := range region.GetStoreIds() {
+		c.updateStoreStatusLocked(i)
+	}
 	return nil
 }
 

@@ -299,6 +299,45 @@ type proposal struct {
 - CompactLog 走 Raft 保证了顺序性：Apply CompactLog 时，所有节点必然已 Apply 了 compactIdx 之前的全部日志，不会误删
 - 物理删除不需要共识——只要 TruncatedState 一致，各节点可以各自慢慢删，删多删少无所谓，下次 GC 会补上
 
+### Scheduler 心跳处理流程 (processRegionHeartbeat)
+
+**位置**: `scheduler/server/cluster.go`
+
+```
+收到 Region 心跳
+  │
+  ├─ 有同 ID 的旧 Region？
+  │    ├─ 是 → 比较版本号，旧的拒绝
+  │    └─ 否 → 扫描 Key 范围重叠的 Region
+  │             比较版本号，旧的拒绝
+  │
+  └─ 通过检查 → 更新 Region 记录 + 更新 Store 状态
+```
+
+**核心思想**：Epoch 版本号就是"新鲜度证明"，谁版本高谁就是真相。
+
+**为什么需要扫描重叠 Region？** Split 产生的新 Region 有新 ID，但 Key 范围和旧 Region 重叠。此时同 ID 查不到旧记录，必须通过 Key 范围扫描找到重叠 Region，比较版本号防止过时心跳覆盖新状态。
+
+### Scheduler 均衡调度流程 (balanceRegionScheduler.Schedule)
+
+**位置**: `scheduler/server/schedulers/balance_region.go`
+
+```
+1. 筛选适合的 Store（在线 && 停机时间未超限）
+2. 按 Region 数量升序排序 → stores[0] 最少，stores[len-1] 最多
+3. 从 Region 最多的 Store 开始往前找可搬的 Region：
+   │
+   ├─ 有 Pending Region？→ 选它，搬！（正在迁移的优先处理完）
+   ├─ 没有 → 有 Follower Region？→ 选它，搬！（影响小，不触发选举）
+   ├─ 没有 → 有 Leader Region？→ 选它，搬！（代价最高，最后选择）
+   └─ 全都没有 → 试下一个 Store
+        │
+        └─ 所有 Store 都没有 → 放弃，返回 nil
+4. 选 toStore（Region 最少的 Store），生成迁移 Operator
+```
+
+**Region 选择优先级**：Pending > Follower > Leader。Pending 优先避免半途而废，Follower 比 Leader 更安全（无需重新选举）。
+
 ### Key Design Patterns
 
 - **Column Families**: Simulated via key prefixing (`${cf}_${key}`) in Badger
@@ -319,6 +358,8 @@ type proposal struct {
 
 ### Core Design Decisions
 
+- **Range 分片 vs Hash 分片**：TinyKV 使用 Range（按 Key 范围）而非 Hash 进行数据分片。原因：(1) Range 可以更好地聚合具有相同前缀的 Key，对 Scan 操作友好；(2) Range 在分片（Split）上比 Hash 更有优势——通常只涉及元数据修改，不需要移动数据。Hash 分片要重新分布数据，代价高且复杂。
+
 - **Region Split 的核心动机**：解决分布式 KV 的数据/负载热点问题。单 Region 过大时会导致所有请求集中到一个 Leader，形成单点瓶颈。Split 将大 Region 拆分成多个小 Region，使 Scheduler 能够将不同 Region 的 Leader 分散到不同 Store，实现真正的水平扩展和负载均衡。这是 Auto-Sharding 的基石。
 
 - **Split 只分裂数据，不改变副本配置**：Split 的本质是数据范围的水平分裂，不是副本配置的变更。如果原 Region 是 3 副本，分裂后的两个新 Region 都必须是 3 副本。通过检查 `len(oldRegion.Peers) == len(newPeerIds)` 确保配置一致性，拒绝过时的 Split 请求。
@@ -332,6 +373,10 @@ type proposal struct {
 - **并发场景下的 Region 元数据深拷贝**：在发送 Region 心跳给 Scheduler 时，使用 `proto.Marshal + proto.Unmarshal` 实现 protobuf 消息的深拷贝（`CloneMsg` 函数），避免并发修改导致脏数据。问题背景：Peer 在发送心跳的同时可能被 Split 操作修改 Region 元数据，直接引用会导致 Scheduler 收到不一致的状态。解决方案：通过序列化 - 反序列化创建独立副本，保证数据传输的原子性。
 
 - **深拷贝 vs 锁的权衡**：为什么选择深拷贝而不是锁？(1) 锁只能保护读取瞬间，不能保护异步发送过程（channel 传输中数据可能被修改）；(2) 锁持有期间阻塞可能导致死锁；(3) 网络传输本就需要序列化，深拷贝是"用确定的小开销换无死锁风险"。核心设计思想：跨线程/协程传输的数据必须独立拥有所有权（ownership transfer）。
+
+### Known Issues (Windows)
+
+- **快照生成 rename 失败**：Windows 上文件被其他进程（杀毒软件、Search Indexer、Badger 自身）占用时，`.sst.tmp` → `.sst` 的 rename 操作会失败（`The process cannot access the file because it is being used by another process`）。导致 `Snapshot()` 反复生成失败，重试 5 次后彻底放弃。影响 ConfChange 后新 Peer 通过快照同步数据的场景（如 `TestBasicConfChange3B`）。**解决方案**：在 WSL/Linux 下跑测试，或在 `doSnapshot` 中对 rename 加重试逻辑。
 
 ### Important Protocols
 

@@ -14,6 +14,9 @@
 package schedulers
 
 import (
+	"fmt"
+	"sort"
+
 	"github.com/pingcap-incubator/tinykv/scheduler/server/core"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/operator"
@@ -75,8 +78,83 @@ func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
 	return s.opController.OperatorCount(operator.OpRegion) < cluster.GetRegionScheduleLimit()
 }
 
+type storeSlice []*core.StoreInfo
+
+func (a storeSlice) Len() int           { return len(a) }
+func (a storeSlice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a storeSlice) Less(i, j int) bool { return a[i].GetRegionSize() < a[j].GetRegionSize() }
+
+// Schedule 避免太多 region 堆积在一个 store
 func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operator {
 	// Your Code Here (3C).
-
-	return nil
+	// 1. 选出所有的 suitableStores
+	stores := make(storeSlice, 0)
+	for _, store := range cluster.GetStores() { // 所有store
+		// 适合被移动的 store 需要满足停机时间不超过 MaxStoreDownTime
+		if store.IsUp() && store.DownTime() < cluster.GetMaxStoreDownTime() { // Store 在线 && 停机时间没超过阈值
+			stores = append(stores, store)
+		}
+	}
+	if len(stores) < 2 { // 至少需要 2 个 Store 才能做均衡。只有 1 个 Store 的话，没有目标可以搬
+		return nil
+	}
+	// 2. 遍历 suitableStores，找到要移动的 region 和 store。 首先找Pending Region, 其次找follower，最后找 leader
+	sort.Sort(stores) // 根据Region 从小到大排序
+	var fromStore, toStore *core.StoreInfo
+	var region *core.RegionInfo
+	for i := len(stores) - 1; i >= 0; i-- { // 从Region 最大的开始遍历
+		var regions core.RegionsContainer
+		// 正在迁移中但还没完成的 Region
+		cluster.GetPendingRegionsWithLock(stores[i].GetID(), func(rc core.RegionsContainer) { regions = rc })
+		// 随机挑一个
+		region = regions.RandomRegion(nil, nil)
+		if region != nil {
+			fromStore = stores[i]
+			break
+		}
+		// 该 Store 上作为 Follower 的 Region
+		cluster.GetFollowersWithLock(stores[i].GetID(), func(rc core.RegionsContainer) { regions = rc })
+		region = regions.RandomRegion(nil, nil)
+		if region != nil {
+			fromStore = stores[i]
+			break
+		}
+		// 该 Store 上作为 Leader 的 Region
+		cluster.GetLeadersWithLock(stores[i].GetID(), func(rc core.RegionsContainer) { regions = rc })
+		region = regions.RandomRegion(nil, nil)
+		if region != nil {
+			fromStore = stores[i]
+			break
+		}
+	}
+	// 如果遍历完所有 Store 都没找到可搬的 Region，返回 nil，本次不调度。
+	if region == nil {
+		return nil
+	}
+	// 3. 判断目标 region 的 store 数量，如果小于 cluster.GetMaxReplicas 直接放弃本次操作
+	storeIds := region.GetStoreIds() // 返回这个region 的所有副本所在的store ID 集合
+	if len(storeIds) < cluster.GetMaxReplicas() {
+		// 当前的region的节点数少于规定， 说明有store 挂了或者正在迁移中，这时候做均衡 没有意义——先把副本补齐比搬来搬去更重要。你总不能在只有 2
+		// 个副本的时候还把其中一个搬走，那样风险更大。
+		return nil
+	}
+	// 4. 再次从 suitableStores 里面找到一个目标 store，目标 store 不能在原来的 region 里面
+	for i := 0; i < len(stores); i++ { // 找到节点最少的store
+		if _, ok := storeIds[stores[i].GetID()]; !ok { // 找一个没有该region的节点的store，就搬到这个store里来
+			toStore = stores[i]
+			break
+		}
+	}
+	if toStore == nil {
+		return nil
+	}
+	// 5. 判断两个 store 的 region size 差值是否小于 2*ApproximateSize，是的话放弃 region 移动
+	if fromStore.GetRegionSize()-toStore.GetRegionSize() < region.GetApproximateSize() {
+		return nil
+	}
+	// 6. 创建 CreateMovePeerOperator 操作并返回
+	newPeer, _ := cluster.AllocPeer(toStore.GetID())
+	desc := fmt.Sprintf("move-from-%d-to-%d", fromStore.GetID(), toStore.GetID())
+	op, _ := operator.CreateMovePeerOperator(desc, cluster, region, operator.OpBalance, fromStore.GetID(), toStore.GetID(), newPeer.GetId())
+	return op
 }
