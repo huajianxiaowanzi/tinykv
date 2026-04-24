@@ -68,14 +68,15 @@ func CreateDB(path string, raft bool) *badger.DB {
 	opts := badger.DefaultOptions
 	if raft {
 		// Do not need to write blob for raft engine because it will be deleted soon.
+		// 这意味着所有数据都直接存储在内存表中，不写值日志文件。因为 Raft 数据会被快速删除，不需要持久化到值日志
 		opts.ValueThreshold = 0
 	}
-	opts.Dir = path
-	opts.ValueDir = opts.Dir
-	if err := os.MkdirAll(opts.Dir, os.ModePerm); err != nil {
+	opts.Dir = path                                            // 数据目录
+	opts.ValueDir = opts.Dir                                   // 值目录
+	if err := os.MkdirAll(opts.Dir, os.ModePerm); err != nil { // 创建数据目录
 		log.Fatal(err)
 	}
-	db, err := badger.Open(opts)
+	db, err := badger.Open(opts) // 打开数据库
 	if err != nil {
 		log.Fatal(err)
 	}

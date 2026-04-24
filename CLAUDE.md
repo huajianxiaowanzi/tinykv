@@ -358,6 +358,12 @@ type proposal struct {
 
 ### Core Design Decisions
 
+- **Rollback 是客户端主动决策，而非 prewrite 的被动响应**：在 2PC 中，客户端并行发送 prewrite 到多个节点。如果某个节点 prewrite 失败或有冲突，客户端决定回滚整个事务，发送 rollback。由于并行发送，rollback 可能比某些 prewrite 先到达目标节点，产生时序竞争。rollback 标记（写入 Write CF）就是"墓碑"，防止迟到的 prewrite 在 rollback 完成后意外成功。
+
+- **Rollback 标记不影响其他事务的原因**：Write CF 的 key 编码包含 commitTs，不同事务的 commitTs 不同，key 自然不同，天然隔离。rollback 标记写入 `{EncodeKey(user_key, T1.startTs) → {Rollback, startTs: T1}}`（rollback 时 commitTs=startTs）。T2 事务操作时：Prewrite 检查冲突扫描 Write CF，发现 Write.startTs ≠ T2.startTs，忽略；Get 扫描时遇到 Rollback 类型，继续往前找有效 Write。只有 T1 自己的迟到请求会匹配 startTs，发现 rollback 标记后立即放弃。本质：MVCC 版本隔离，rollback 标记写在 T1 的 key 上，T2 走的是 T2 的 key，两条路不交叉。
+
+- **MVCC 三 CF 结构**：Lock CF 存储 `{user_key → {primary, startTs, kind, ttl}}`，不带时间戳，同一 key 只能有一个锁。Default CF 存储 `{EncodeKey(user_key, startTs) → value}`，Prewrite 时写入实际数据，多版本。Write CF 存储 `{EncodeKey(user_key, commitTs) → {kind, startTs}}`，记录事务状态（Put/Del/Rollback），commitTs 降序排列，作为版本索引。读取流程：Lock 检查 → Write 定位 commitTs ≤ startTs 的最新 Put/Del → 用 Write.startTs 从 Default 取值。
+
 - **Range 分片 vs Hash 分片**：TinyKV 使用 Range（按 Key 范围）而非 Hash 进行数据分片。原因：(1) Range 可以更好地聚合具有相同前缀的 Key，对 Scan 操作友好；(2) Range 在分片（Split）上比 Hash 更有优势——通常只涉及元数据修改，不需要移动数据。Hash 分片要重新分布数据，代价高且复杂。
 
 - **Region Split 的核心动机**：解决分布式 KV 的数据/负载热点问题。单 Region 过大时会导致所有请求集中到一个 Leader，形成单点瓶颈。Split 将大 Region 拆分成多个小 Region，使 Scheduler 能够将不同 Region 的 Leader 分散到不同 Store，实现真正的水平扩展和负载均衡。这是 Auto-Sharding 的基石。

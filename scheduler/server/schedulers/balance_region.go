@@ -69,7 +69,6 @@ func (s *balanceRegionScheduler) GetName() string {
 	}
 	return balanceRegionName
 }
-
 func (s *balanceRegionScheduler) GetType() string {
 	return "balance-region"
 }
@@ -99,10 +98,10 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 		return nil
 	}
 	// 2. 遍历 suitableStores，找到要移动的 region 和 store。 首先找Pending Region, 其次找follower，最后找 leader
-	sort.Sort(stores) // 根据Region 从小到大排序
+	sort.Sort(stores) // 根据store 占用的数据字节大小排序， 均衡的目标是磁盘空间
 	var fromStore, toStore *core.StoreInfo
 	var region *core.RegionInfo
-	for i := len(stores) - 1; i >= 0; i-- { // 从Region 最大的开始遍历
+	for i := len(stores) - 1; i >= 0; i-- { // 从数据字节 最大的store 开始遍历
 		var regions core.RegionsContainer
 		// 正在迁移中但还没完成的 Region
 		cluster.GetPendingRegionsWithLock(stores[i].GetID(), func(rc core.RegionsContainer) { regions = rc })
@@ -148,12 +147,14 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 	if toStore == nil {
 		return nil
 	}
-	// 5. 判断两个 store 的 region size 差值是否小于 2*ApproximateSize，是的话放弃 region 移动
+	// 5. fromStore: 50MB    toStore: 45MB
+	//    差值 = 50 - 45 = 5MB
+	//    5MB < 10MB → 放弃！ 两个store 数据均衡， 没有搬迁节点的必要
 	if fromStore.GetRegionSize()-toStore.GetRegionSize() < region.GetApproximateSize() {
 		return nil
 	}
 	// 6. 创建 CreateMovePeerOperator 操作并返回
-	newPeer, _ := cluster.AllocPeer(toStore.GetID())
+	newPeer, _ := cluster.AllocPeer(toStore.GetID()) // 目标store创建一个peer
 	desc := fmt.Sprintf("move-from-%d-to-%d", fromStore.GetID(), toStore.GetID())
 	op, _ := operator.CreateMovePeerOperator(desc, cluster, region, operator.OpBalance, fromStore.GetID(), toStore.GetID(), newPeer.GetId())
 	return op
