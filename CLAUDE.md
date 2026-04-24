@@ -397,3 +397,105 @@ type proposal struct {
 - Tests use mock network with configurable partitions and reliability
 - Badger fork: `github.com/Connor1996/badger` (not the original dgraph-io/badger)
 - Always call `Discard()` on badger.Txn and close iterators
+
+## 面试复习框架：三层金字塔
+
+面试讲述任何功能时，要讲清楚三点：
+
+```
+┌────────────────────────────────────────┐
+│           第三层：为什么这么设计          │  ← 面试亮点
+│  （设计决策、对比 TiKV/Raft 论文、取舍）    │
+├────────────────────────────────────────┤
+│           第二层：数据怎么流转             │  ← 面试核心
+│     （画出每个操作的数据流图，能讲清楚）     │
+├────────────────────────────────────────┤
+│           第一层：是什么                   │  ← 基础理解
+│     （这个功能做了什么，解决了什么问题）     │
+└────────────────────────────────────────┘
+```
+
+### 各项目核心要点
+
+#### Project 2A: Raft 状态机
+
+| 层级 | 要点 |
+|------|------|
+| **是什么** | 实现 Raft 共识算法，保证分布式系统数据一致性 |
+| **怎么做** | 选举：`MsgRequestVote` + 随机超时 → 多数票 → Leader<br>日志复制：`MsgAppend` → Follower append → 多数确认 → commit |
+| **为什么** | 随机超时避免分裂票；`MatchIndex`/`NextIndex` 保证日志一致性 |
+
+#### Project 2B: Raft KV（面试核心）
+
+| 层级 | 要点 |
+|------|------|
+| **是什么** | 基于 Raft 实现分布式 KV 存储，写请求通过 Raft 共识 |
+| **怎么做** | Client → RaftStorage → propose → Ready → apply → callback（画完整数据流图） |
+| **为什么** | **Follower 也 Apply**：快速故障切换 + 本地读取优化（TiKV 设计，区别于论文） |
+
+**关键问题**：
+- proposal 是什么？→ index+term+callback，用于 Apply 时匹配请求
+- 为什么 Follower 也 Apply？→ Leader 挂掉后 Follower 立即可用
+
+#### Project 2C: Snapshot + Log GC
+
+| 层级 | 要点 |
+|------|------|
+| **是什么** | Raft 日志压缩，防止日志无限增长 |
+| **怎么做** | CompactLog 走 Raft → 更新 TruncatedState → 异步物理删除 |
+| **为什么** | 元数据变更走 Raft 保证所有节点一致；物理删除异步执行不阻塞主流程 |
+
+#### Project 3B: Region Split（面试核心）
+
+| 层级 | 要点 |
+|------|------|
+| **是什么** | 数据分片机制，将大 Region 分裂成多个小 Region |
+| **怎么做** | SplitCheck → Admin Request → 走 Raft → 创建新 Region → 注册 Peer |
+| **为什么** | **Range 分片而非 Hash**：Scan 友好 + Split 不搬数据<br>新 Peer 继承 StoreId：原地分裂，负载均衡由 Scheduler 后续做 |
+
+#### Project 4B: MVCC + 2PC（面试核心）
+
+| 层级 | 要点 |
+|------|------|
+| **是什么** | Percolator 模式两阶段提交事务 |
+| **怎么做** | Prewrite：检冲突 → 写 Default → 加 Lock<br>Commit：写 Write →删 Lock |
+| **为什么** | **两种锁**：Latches 本地并发，Lock CF 分布式事务<br>**Rollback 标记**：防止迟到的 prewrite 意外成功 |
+
+### 面试高频问题
+
+| 问题 | 回答要点 |
+|------|----------|
+| Raft 怎么实现的？ | 选举（MsgRequestVote）+ 日志复制+ heartbeat |
+| 写请求完整流程？ | Client → RaftStorage → propose → Ready → apply → callback |
+| Follower 为什么也 Apply？ | 快速故障切换 + 本地读取（TiKV 设计） |
+| Range 分片 vs Hash？ | Scan 友好 + Split 不搬数据 |
+| MVCC 怎么实现的？ | 三 CF（Lock/Default/Write）+ 时间戳编码 |
+| 事务怎么保证？ | 2PC（Prewrite + Commit）+ Percolator 模型 |
+| Latches vs Lock CF？ | Latches 本地并发，Lock CF 分布式事务 |
+| CompactLog 为什么走 Raft？ | 保证 TruncatedState 一致 |
+
+### 面试讲述模板
+
+```
+"这个项目我实现了 TinyKV，一个分布式 KV 存储...
+
+【架构层】
+计算存储分离：Scheduler 调度 + Raft 共识 + MVCC 事务
+
+【Raft 层】
+我实现了完整的 Raft 状态机。写请求通过 propose 进入 Raft，
+Leader 复制日志，多数确认后 commit。有个设计要点：Follower
+也 Apply 到状态机，这样故障切换更快，支持本地读取。
+
+【分片层】
+我用 Range 分片，不是 Hash。好处是 Scan 友好，Split 不需要
+搬数据。Region 的版本号用 RegionEpoch 控制，拒绝过时请求。
+
+【事务层】
+我用 Percolator 模式的两阶段提交。Prewrite 检冲突加锁，
+Commit 写提交记录。有个细节：需要两种锁——Latches 防止
+本地并发，Lock CF 做分布式事务锁。
+
+【亮点】
+遇到过 CompactLog 的并发竞争问题，通过双重检查解决..."
+```
